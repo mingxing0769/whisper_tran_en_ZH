@@ -1,2 +1,1 @@
-"# whisper_tran_en_ZH" 
-"# whisper_tran_en_ZH" 
+使用WHISPER模型 和BAIDU翻译API 实时语音翻译并显示字幕
