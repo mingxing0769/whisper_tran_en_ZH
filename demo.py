@@ -1,178 +1,227 @@
 import io
 import os
-import time
-import argparse
+import random
 import threading
-from datetime import datetime, timedelta
+import tkinter as tk
+from hashlib import md5
 from queue import Queue
-from tempfile import NamedTemporaryFile
-from time import sleep
-from sys import platform
+from tkinter import font
+
+import requests
 import speech_recognition as sr
 import whisper
-import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+from dotenv import load_dotenv
 
+# 下载/加载whisper语音模型
+model = 'base.en'
+audio_model = whisper.load_model(model, device='cuda:0', download_root='./models', in_memory=True)
+print("whisper Model loaded.\n")
 
+# 加载.env文件中的变量
+load_dotenv()
 
+# 初始化音频设备
+recognizer = sr.Recognizer()
+source = sr.Microphone(sample_rate=16000)
+recognizer.energy_threshold = 300
+recognizer.dynamic_energy_threshold = True
 
-
-def transcribe_audio(audio_data, audio_model, temp_file):
-    wav_data = io.BytesIO(audio_data.get_wav_data())
-    with open(temp_file, 'w+b') as f:
-        f.write(wav_data.read())
-    result = audio_model.transcribe(temp_file, fp16=torch.cuda.is_available())
-    text = result['text'].strip()
-    return text
-
-
-def translate_text(text, translation_pipeline):
-    translated_text = translation_pipeline(text, max_length=450)[0]['translation_text']
-    return translated_text
-
+# 初始化所有变量
 data_queue = Queue()
+audio_queue = Queue()
+last_sample = bytes()
+phrase_time = None
+temp_file = './temp/temp.wav'
+transcription = ['']
+text_date = Queue()
+App_id = os.getenv('appid')
+App_key = os.getenv('appkey')
 
-def main():
-    global data_queue
+with source:
+    recognizer.adjust_for_ambient_noise(source)
 
-    # 初始化翻译模型
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--device', default="cuda:0", type=str, help='Device to use (e.g. "cpu", "cuda:0")')
-    args = parser.parse_args()
-    device = args.device
-    model_name = 'DDDSSS/translation_en-zh'
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    translation_pipeline = pipeline("translation_en_to_zh", model=model, tokenizer=tokenizer,
-                                     torch_dtype="float", device=device)
 
-    print("Model loaded")
+def record_callback(_, audio: sr.AudioData) -> None:
+    data = audio.get_raw_data()
+    audio_queue.put(data)
+    if not audio_queue.empty():
+        data = audio_queue.get()
+        _audio(data)
 
-    # 初始化语音模型
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="tiny", help="Model to use",
-                        choices=["tiny", "base", "small", "medium", "large"])
-    parser.add_argument("--non_english", action='store_true',
-                        help="Don't use the english model.")
-    parser.add_argument("--energy_threshold", default=1000,
-                        help="Energy level for mic to detect.", type=int)
-    parser.add_argument("--record_timeout", default=2,
-                        help="How real time the recording is in seconds.", type=float)
-    parser.add_argument("--phrase_timeout", default=4,
-                        help="How much empty space between recordings before we "
-                             "consider it a new line in the transcription.", type=float)
-    if 'linux' in platform:
-        parser.add_argument("--default_microphone", default='pulse',
-                            help="Default microphone name for SpeechRecognition. "
-                                 "Run this with 'list' to view available Microphones.", type=str)
-    args = parser.parse_args()
 
-    # The last time a recording was retreived from the queue.
-    phrase_time = None
-    # Current raw audio bytes.
-    last_sample = bytes()
-    # Thread safe Queue for passing data from the threaded recording callback.
-    data_queue = Queue()
-    # We use SpeechRecognizer to record our audio because it has a nice feauture where it can detect when speech ends.
-    recorder = sr.Recognizer()
-    recorder.energy_threshold = args.energy_threshold
-    # Definitely do this, dynamic energy compensation lowers the energy threshold dramtically to a point where the SpeechRecognizer never stops recording.
-    recorder.dynamic_energy_threshold = False
+recognizer.listen_in_background(source, record_callback, phrase_time_limit=5)  #phrase_time_limit=5 延时5秒
 
-    # Important for linux users.
-    # Prevents permanent application hang and crash by using the wrong Microphone
-    if 'linux' in platform:
-        mic_name = args.default_microphone
-        if not mic_name or mic_name == 'list':
-            print("Available microphone devices are: ")
-            for index, name in enumerate(sr.Microphone.list_microphone_names()):
-                print(f"Microphone with name \"{name}\" found")
-            return
-        else:
-            for index, name in enumerate(sr.Microphone.list_microphone_names()):
-                if mic_name in name:
-                    source = sr.Microphone(sample_rate=16000, device_index=index)
-                    break
+
+# 音频处理 保存到临时文件
+def _audio(audio_data):
+    try:
+        wav = sr.AudioData(audio_data, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+        wav_data = io.BytesIO(wav.get_wav_data())
+
+        with open(temp_file, 'w+b') as f:
+            f.write(wav_data.read())
+        data_queue.put(temp_file)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+# 获取处理后的音频 转换成文字
+def whisper_to_E_text():
+    if not data_queue.empty():
+        audio_file = data_queue.get()
+        result = audio_model.transcribe(audio_file, temperature=0.4)
+        text = result['text'].strip()
+        # print(f"text: {text}")
+        return text
     else:
-        source = sr.Microphone(sample_rate=16000)
-
-    # Load / Download model
-    model = args.model
-    if args.model != "large" and not args.non_english:
-        model = model + ".en"
-    audio_model = whisper.load_model(model)
-
-    record_timeout = args.record_timeout
-    phrase_timeout = args.phrase_timeout
+        return None
 
 
+# 获取英文文字 翻译成中文
+def baidu_tran(E_text):
+    if E_text is not None:
+        appid = App_id
+        appkey = App_key
+        from_lang = 'en'
+        to_lang = 'zh'
+        endpoint = 'http://api.fanyi.baidu.com'
+        path = '/api/trans/vip/translate'
+        url = endpoint + path
+        query = E_text
+
+        def make_md5(s, encoding='utf-8'):
+            return md5(s.encode(encoding)).hexdigest()
+
+        salt = random.randint(32768, 65536)
+        sign = make_md5(appid + query + str(salt) + appkey)
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        payload = {'appid': appid, 'q': query, 'from': from_lang, 'to': to_lang, 'salt': salt, 'sign': sign}
+        r = requests.post(url, params=payload, headers=headers)
+        result = r.json()
+
+        if 'trans_result' in result and len(result['trans_result']) > 0:
+            C_text = result['trans_result'][0]['dst'].strip()
+            # print('<<:', C_text)
+            return C_text
+        else:
+            print("Translation result not found in the API response.")
+            return None
+
+    else:
+        return None
 
 
-    temp_file = NamedTemporaryFile(delete=False).name
-    transcription = ['']
-
-
-    with source:
-        recorder.adjust_for_ambient_noise(source)
-
-    def record_callback(_, audio: sr.AudioData) -> None:
-        """
-        Threaded callback function to recieve audio data when recordings finish.
-        audio: An AudioData containing the recorded bytes.
-        """
-        # Grab the raw bytes and push it into the thread safe queue.
-        data = audio.get_raw_data()
-        data_queue.put(data)
-
-    # Create a background thread that will pass us raw audio bytes.
-    # We could do this manually but SpeechRecognizer provides a nice helper.
-    recorder.listen_in_background(source, record_callback, phrase_time_limit=record_timeout)
-
-    # Cue the user that we're ready to go.
-    print("Model loaded.\n")
-
+# 将中 英文保存到变量 待显示到窗口
+def update_text():
     while True:
-        try:
-            now = datetime.utcnow()
-            if not data_queue.empty():
-                phrase_complete = False
-                if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
-                    last_sample = bytes()
-                    phrase_complete = True
-                phrase_time = now
+        E_text = whisper_to_E_text()
+        if E_text is not None:
+            C_text = baidu_tran(E_text)
+            if C_text:
+                # 将需要更新的文本放入队列
+                text_date.put((E_text, C_text))
+            # time.sleep(1)
 
-                while not data_queue.empty():
-                    data = data_queue.get()
-                    last_sample += data
 
-                audio_data = sr.AudioData(last_sample, source.SAMPLE_RATE, source.SAMPLE_WIDTH)
+# 创建窗口 并获取中 英文文本显示到窗口
+def create_window():
+    window = tk.Tk()
+    window.geometry("1200x80")  # 初始窗口大小，可以随意拉大或缩小
+    window.overrideredirect(True)  # 隐藏标题栏
+    window.attributes('-alpha', 0.5)  # 设置窗口透明度为50%
+    window.attributes('-topmost', 1)  # 设置窗口置顶
 
-                text = transcribe_audio(audio_data, audio_model, temp_file)
+    # 创建一个Frame容器，用于放置两个Label
+    frame = tk.Frame(window)
+    frame.pack(fill=tk.BOTH, expand=True)
 
-                if phrase_complete:
-                    transcription.append(text)
-                else:
-                    transcription[-1] = text
+    E_text, C_text = text_date.get()
 
-                os.system('cls' if os.name == 'nt' else 'clear')
-                for line in transcription:
-                    print(line)
-                    translated_text = translate_text(line, translation_pipeline)
-                    print("翻译：", translated_text)
-                print('', end='', flush=True)
+    # 创建两个Label，一个用于显示英文，一个用于显示中文
+    english_text = tk.Label(frame, text=E_text, bg="black", fg="white")
+    chinese_text = tk.Label(frame, text=C_text, bg="black", fg="white")
 
-                sleep(0.25)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print(f"Error: {e}")
+    # 设置字体大小
+    english_font = font.Font(size=13)
+    chinese_font = font.Font(size=16)
+    english_text.config(font=english_font, anchor='nw', justify='left')
+    chinese_text.config(font=chinese_font, anchor='nw', justify='left')
 
-    print("\n\nTranscription:")
-    for line in transcription:
-        print(line)
+    # 将Label放置到Frame容器中
+    english_text.pack(fill=tk.BOTH, expand=True)
+    chinese_text.pack(fill=tk.BOTH, expand=True)
 
-    os.remove(temp_file)
+    def update_wraplength(event):
+        english_text.config(wraplength=window.winfo_width())
+        chinese_text.config(wraplength=window.winfo_width())
+
+    window.bind("<Configure>", update_wraplength)
+
+    # 添加鼠标事件处理函数
+    def start_move(event):
+        window.x = event.x
+        window.y = event.y
+
+    def stop_move(event):
+        window.x = None
+        window.y = None
+
+    def do_move(event):
+        dx = event.x - window.x
+        dy = event.y - window.y
+        x = window.winfo_x() + dx
+        y = window.winfo_y() + dy
+        window.geometry(f"+{x}+{y}")
+
+    def start_resize(event):
+        window.startX = event.x
+        window.startY = event.y
+
+    def stop_resize(event):
+        window.startX = None
+        window.startY = None
+
+    def do_resize(event):
+        dx = event.x - window.startX
+        dy = event.y - window.startY
+        width = window.winfo_width() + dx
+        height = window.winfo_height() + dy
+        window.geometry(f"{width}x{height}")
+
+    # 绑定鼠标事件到窗口上
+    window.bind("<ButtonPress-1>", start_move)
+    window.bind("<ButtonRelease-1>", stop_move)
+    window.bind("<B1-Motion>", do_move)
+
+    # 创建一个用于调整大小的控件，并绑定鼠标事件到该控件上
+    sizer = tk.Label(window, bg="red")
+    sizer.place(relx=1.0, rely=1.0, anchor="se")
+    sizer.bind("<ButtonPress-1>", start_resize)
+    sizer.bind("<ButtonRelease-1>", stop_resize)
+    sizer.bind("<B1-Motion>", do_resize)
+
+    def get_text():
+        if not text_date.empty():
+            local_E_text, local_C_text = text_date.get()
+            english_text.config(text=local_E_text)
+            chinese_text.config(text=local_C_text)
+
+        # 使用after方法定期调用更新函数
+        window.after(100, get_text)
+
+    get_text()
+
+    return window
 
 
 if __name__ == "__main__":
-    main()
+    load_dotenv()
+
+    # 创建并启动update_text线程
+    thread = threading.Thread(target=update_text)
+    thread.daemon = True  # 这允许线程在主程序退出时退出
+    thread.start()
+
+    # 创建并运行tkinter窗口
+    window = create_window()
+    window.mainloop()
